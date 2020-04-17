@@ -1,0 +1,1205 @@
+---
+title: "Spotify - Social Network Modeling & Analysis"
+author: "Pedro H. Puntel -- pedro.puntel@gmail.com"
+date: "Última atualização: 10/02/2020"
+output: html_document
+---
+
+```{r, preamble, include=FALSE, echo=FALSE, warning=FALSE}
+# Pacotes
+library("dplyr")
+library("plotly")
+library("igraph")
+library("MCMCpack")
+library("latentnet")
+library("Rspotify")
+
+# Chaves secretas de usuário para autenticação com API do Spotify
+setwd("C:\\Users\\pedro\\Desktop\\R\\PIBIC\\Analyses\\Spotify\\Database\\Private Key")
+token_data = rio::import(file = "Spotify_Secret_Keys.csv", format = "csv") %>% as.data.frame()
+
+# Data Frame com as "Unique IDs" das charts que serão scrapeadas
+setwd("C:\\Users\\pedro\\Desktop\\R\\PIBIC\\Analyses\\Spotify\\Database")
+global_top50 = rio::import(file = "Global_Top50_PlaylistID.csv", format = "csv") %>% as.data.frame()
+country_top_50 = rio::import(file = "Country_Top50_PlaylistID.csv", format = "csv") %>% as.data.frame()
+```
+
+## **1. Introdução**
+Este relatório resume os processos utilizados para coleta, análise e modelagem estatística de
+dados provenientes da plataforma *Spotify*, ressaltando também as principais descobertas e
+peculiaridades da mesma sob a perspectiva de redes sociais.
+
+A motivação por trás da escolha do *Spotify* como fonte de dados deve-se não só a um interesse
+pessoal pela plataforma, como também uma curiosidade em entender e quantificar o gosto musical
+dos países e as suas semelhanças através da música. Não obstante, como estudante de estatística,
+houve interesse em estudar a perfomance/interpretabilidade de alguns modelos antes estudados, como
+é o caso com o **Escalonamento Multidimensional** e **Modelo de Distâncias Latentes**.
+
+Adicionalmente, demais outros facilitadores pertinentes à linguagem *R*, como a existência dos pacotes
+*Rspotify* e *latentnet*, tornaram todo o processo de obtenção e modelagem dos dados muito mais
+simples e direto, motivando ainda mais a análise.
+
+## **2. Dados**
+Os dados desta análise consistem em 51 playlists de autoria do próprio *Spotify* (usuário *spotifycharts*),
+contemplando as charts *Global Top 50* e *Top 50 By Country*, sendo esta última extraída de 50 dos 63 países
+disponíveis na plataforma.
+
+De posse destas playlists, foi então montada uma matriz $\bf{A}$ simétrica, de dimensão $50x50$, denominada **sócio-matriz**, cujas entradas $\bf{a_{ij}}$ denotam o **número de músicas compartilhadas entre os países i e j**
+com base seu *Top 50* associado. Tal sócio-matriz é frequentemente apontada pela literatura como
+uma estrutura de dados adequada para comportar dados de redes sociais.
+
+Construída esta sócio-matriz, deriva-se como estrutura de rede social um grafo, cujos vértices são
+os países e as arestas o referido número de músicas compartilhadas entre os mesmos.
+
+Em um segundo e último momento, em comparação direta com a *Global Top 50 chart*, foi atribuído a cada país um
+**índice de autenticidade** (variando entre 0 e 1), com a seguinte interpretação:
+
+\n
+  **Um país é dito autêntico, isto é, com índice de autenticidade mais próximo de 1, se o mesmo não**
+                  **compartilha muitas músicas com demais outros países no seu Top 50**
+\n
+
+A seguir serão apresentados os passos realizados para a obtenção e estruturação dos dados. É
+importante mencionar que antes de tudo, foi necessária uma inscrição no site **https://developer.spotify.com** para utilização da *REST Spotify Web API*.
+
+#### **2.1 - Autenticação de Usuário**
+```{r, spotify_oauth, include=TRUE, echo=TRUE, warning=FALSE}
+# Autenticação com a REST API do Spotify
+my_auth = spotifyOAuth(token_data$App_Name, token_data$Public_Key, token_data$Private_Key)
+```
+
+#### **2.2 - Arquivo com os links das charts de interesse**
+```{r, charts_df, include=TRUE, echo=TRUE, warning=FALSE}
+# Arquivo com os links das charts que serão coletadas pela rotina
+kableExtra::kable(country_top_50) %>%
+  kableExtra::kable_styling() %>%
+  kableExtra::scroll_box(width = "100%", height = "400px")
+```
+
+#### **2.3 - Coleta dos dados e Montagem da Sócio-Matriz**
+```{r, spotify_scrap, include=TRUE, echo=TRUE, warning=FALSE}
+# Rotina que implementa o processo de coleta dos dados
+spotify_countries_scrap = function() {
+  
+  # Obtenção atualizada da playlist "Global Top 50"
+  global_df = matrix(NA, nrow=50, ncol=1) %>% as.data.frame()
+  global_df = getPlaylistSongs("spotifycharts",
+                               global_top50[1,1],
+                               token=my_auth)$tracks[1:50]
+  
+  # Obtenção da playlist "Top 50 by Country"
+  top50_df = matrix(NA, nrow=50, ncol=50) %>% as.data.frame()
+  for(i in 1:ncol(top50_df)) {
+    playlist_songs = getPlaylistSongs(
+      user_id = "spotifycharts",
+      playlist_id = country_top_50$Country_Top50_Track_ID[i],
+      token = my_auth
+    )
+    top50_df[1,i] = country_top_50$Country[i]
+    top50_df[,i] = playlist_songs$tracks[1:50]
+  }
+  colnames(top50_df) = country_top_50$Country
+  
+  # Montagem da sócio-matriz associada à chart "Top 50 by Country"
+  top50_social_matrix = matrix(NA, nrow=50, ncol=50)
+  for (i in 1:50) {
+    for (j in 1:50) {
+      counter = length(intersect(top50_df[,i], top50_df[,j]))
+      top50_social_matrix[i,j] = counter
+    }
+  }
+  colnames(top50_social_matrix) = colnames(top50_df)
+  rownames(top50_social_matrix) = colnames(top50_df)
+  
+  # Número de músicas em comum que cada país compartilha com a chart "Global Top 50"
+  # . "Quão similar ao gosto musical mundial é o gosto de cada país?"
+  aut_score = matrix(NA, nrow=50, ncol=2) %>% as.data.frame()
+  for(i in 1:50) {
+    
+    # Inverso da proporção de músicas da chart global que pertencem à chart do país
+    aut_score[i,2] = 1/((length(intersect(global_df, top50_df[, i])))/50)
+  }
+  colnames(aut_score) = c("Country","Score")
+  aut_score$Country = as.vector(colnames(top50_social_matrix))
+  aut_score$Score = as.numeric(as.vector(aut_score$Score))
+  
+  # Normaliza e ordena de forma decrescente do índice para melhor entendimento
+  aut_score$Score = (aut_score$Score-min(aut_score$Score))/
+                    (max(aut_score$Score)-min(aut_score$Score))
+  aut_score = aut_score[order(aut_score$Score, decreasing=T),]
+  
+  # Retorna as informações
+  return(list("Global_Top_50" = global_df,
+              "Top50_Country" = top50_df,
+              "Top50_Social_Matrix" = top50_social_matrix,
+              "Autenticity_Score" = aut_score))
+  
+}
+spotify_countries_scrap = compiler::cmpfun(spotify_countries_scrap)
+spotify_data = spotify_countries_scrap()
+```
+
+#### **2.4 - Sócio-Matriz**
+```{r, social_matrix, include=TRUE, echo=TRUE, warning=FALSE}
+# Sócio-Matriz
+kableExtra::kable(spotify_data$Top50_Social_Matrix) %>%
+  kableExtra::kable_styling() %>%
+  kableExtra::scroll_box(width = "100%", height = "400px")
+```
+
+#### **2.5 - Score de Autenticidade**
+```{r, autenticity_index, inlclude=TRUE, echo=TRUE, warning=FALSE}
+# Índice de Autenticidade
+spotify_data$Autenticity_Score[1:3,1:2]
+```
+
+## **3. Análise Exploratória**
+Como de costume, em etapa que precede a modelagem dos dados, foi feita uma análise exploratória
+com o intuito de obter insights iniciais sobre a estrutura de relacionamentos implícita
+nos gostos musicais dos países.
+
+Esta subseção se divide basicamente em duas etapas. Primeiramente, serão feitas estatísticas descritivas
+básicas com base na sócio-matriz e posteriormente, uma análise mais profunda fundamentada em
+conceitos de redes sociais. Estas últimas são derivadas em grande parte explorando-se propriedades
+espectrais da sócio-matriz utilizando Álgebra Linear avançada.
+
+```{r, preamble2, warning=FALSE, include=FALSE}
+# Inputação dos dados
+social_matrix = spotify_data$Top50_Social_Matrix
+aut_index = spotify_data$Autenticity_Score
+
+# Constroí o grafo que modelará a rede
+spotify_graph = graph_from_adjacency_matrix(social_matrix, mode="undirected", diag=F, weighted=T)
+
+# Número de músicas compartilhadas com os países como atributo adicional
+V(spotify_graph)$conex = colSums(social_matrix)
+
+# Reordena o data frame com os scores de autenticidade
+aut_index = aut_index[order(aut_index$Score, decreasing = T),]
+```
+
+#### **3.1 - Heatmap da Sócio-Matriz**
+```{r, heatmap, include=TRUE, echo=TRUE, warning=TRUE, fig.align="center", out.width="100%"}
+plot_ly(z=social_matrix, x=colnames(social_matrix), y=colnames(social_matrix),
+        type="heatmap", zauto=F, zmin=0, zmax=50, colors=heat.colors(n=256)) %>%
+  layout(xaxis=list(categoryorder="array", categoryarray=colnames(social_matrix)),
+         yaxis=list(categoryorder="array", categoryarray=colnames(social_matrix))) %>%
+  colorbar(title="Músicas compartihadas")
+```
+
+#### **3.2 - Número de músicas compartilhadas com os demais países**
+```{r, barchart_1, include=TRUE, echo=TRUE, warning=TRUE, fig.align="center", out.width="100%"}
+aux_vec = sort(colSums(social_matrix), decreasing=T)-50 # desconsidera a diagonal da sociomatriz
+plot_ly(as.data.frame(aux_vec), x=names(aux_vec), y=aux_vec, type="bar", marker=list(color="blue")) %>%
+  layout(xaxis=list(categoryorder="array", categoryarray=names(aux_vec)),
+         yaxis=list(categoryorder="array", categoryarray=aux_vec)) %>%
+  rangeslider()
+```
+
+#### **3.3 - Score de autenticidade de gosto musical dos países**
+```{r, barchart_2, include=TRUE, echo=TRUE, warning=FALSE, fig.align="center", out.width="100%"}
+plot_ly(data=aut_index, x=aut_index$Country, y=aut_index$Score, type="bar", marker=list(color="green")) %>%
+  layout(xaxis=list(categoryorder="array", categoryarray=aut_index$Country),
+         yaxis=list(categoryorder="array", categoryarray=aut_index$Score)) %>%
+  rangeslider()
+```
+
+#### **3.4 - Graph-Level Indicies**
+```{r, graph_glis, include=TRUE, echo=TRUE, warning=FALSE, fig.align="center", out.width="100%"}
+# Rotina que computa características globais do Grafo
+graph_glis = function(g, use.loops, has.directions, has.weights) {
+  
+  # Sub-rotina que retorna características básicas do grafo
+  graph_stats = function(g) {
+    
+    # Número de arestas
+    edge_count = ecount(g)
+    
+    # Número de vértices
+    vertex_count = vcount(g)
+    
+    # Densidade do Grafo 
+    g_density = graph.density(g, loops=use.loops)
+    
+    # Diâmetro do Grafo
+    g_diameter = diameter(g, directed=has.directions,
+                          unconnected=is.connected(g, mode="strong"))
+    
+    # Vértices mais afastados
+    # . Caso existam vários caminhos com o mesmo diâmetro, retorna os
+    # vértices que compõem os extremos do primeiro diâmetro encontrado.
+    g_far_vertices = names(
+        farthest_vertices(g, directed=has.directions,
+                          unconnected=is.connected(g, mode="strong"))[[1]]
+    )
+
+    # Transitividade do Grafo
+    # . Quão interligadas são as conexões entre os vértices do grafo.
+    # Na literatura, para grafos não-direcionados, a transitividade
+    # se dá pela razão entre  o número de loops de tamanho 3 e o total
+    # de arestas do grafo.
+    if (isTRUE(has.directions)) {
+      g_trans = transitivity(g, type ="directed", isolates =NaN)
+    } else {
+      g_trans = transitivity(g, type ="undirected", isolates =NaN)
+    }
+    
+    # Pareamento Assortativo/Dissortativo
+    #
+    #  Um fenômeno comum em redes sociais é a tendência natural dos atores
+    # em associar-se com aqueles semelhantes a si mesmos de alguma forma.
+    # Tal tendência é chamada de  homofilia ou mistura combinatória. É possível
+    # ainda, porém de forma mais rara, também encontramos uma mistura desassortativa,
+    # ou seja, a tendência dos se associarem com outros diferentes de si.
+    #
+    #  O pareamento assortativo de atores em uma rede pode ser identificado
+    # por meio de  características enumerativas ou escalares. Uma característica
+    # enumerativa tem um conjunto finito de valores possíveis. Exemplos são gênero,
+    # raça e nacionalidade. Dada uma característica enumerativa, cada nó da rede
+    # pode ser atribuído a um tipo de acordo com o valor da característica para o
+    # vértice. Assim, dizemos que uma rede é então assortativa se uma fração
+    # significativa das arestas ligam entre vértices do mesmo tipo.
+    #
+    #  Matematicamente, uma medidade de assortatividade é definida pelo número
+    # de arestas que ocorrem entre vértices do mesmo tipo diminúidas daquelas
+    # as quais esperaríamos encontrar em uma disposição aleatória dos vértices
+    # na rede. Indo além, pode-se provar que a assortatividade de um vértice é
+    # dada pela sua covariância com os demais pares e que ao ser 'normalizada'
+    # coincide com o coeficiente de correalção de Pearson.
+    #
+    # Aqui, para o caso da nossa rede com oas países do Spotify, será feita uma
+    # análise de homofilia com base no número total de músicas compartilhadas com
+    # os demais países.
+    g_assortativity = assortativity(g, types1=V(g)$conex , directed=has.directions)
+    
+    # Construção de uma tabela com as informações
+    out_df = c(edge_count, vertex_count, g_density, g_diameter,
+               stringr::str_c(g_far_vertices[1],",",g_far_vertices[2]),
+               g_trans, g_assortativity) %>% matrix(nrow=1, ncol=7, byrow = F) 
+    
+    # Renomeia as colunas
+    colnames(out_df) = c("Edges","Vertices","Density","Diameter",
+                         "Farthest Vertices","Transitivity","Assortativity")
+    
+    # Retorna as informações
+    return(out_df)
+   
+  }
+  
+  # Retorna os resultados
+  list("Graph Stats" = graph_stats(g)) %>% return()
+  
+}
+graph_glis = compiler::cmpfun(graph_glis)
+
+# Resultados
+g_glis = graph_glis(spotify_graph,F,F,T)$`Graph Stats`
+kableExtra::kable(g_glis) %>% kableExtra::kable_styling()
+```
+   
+- Grafo totalmente conexo, de forma que não existem vértices sem conexões. No contexto da rede,
+isto significa que **não existe nenhum país que não compartilha nenhuma música no seu Top 50 com os demais.**
+  
+      
+- Maior geodésico possui tamanho 8 (diâmetro), traçado entre Bélgica e Portugal. Interpretando, pode-se
+dizer que tais países **são aqueles com maior disparidade em termos de gosto musical.**
+  
+  
+- **Transitividade máxima é uma decorrência natural da alta densidade**, de forma que partindo-se de
+qualquer vértice, atinge-se qualquer outro na rede. Em outras palavras, escolhendo-se uma playlist
+de um país qualquer, certamente existirão músicas desta que compõem também a playlist de um outro país.
+  
+- **Dessortatividade fraca** entre vértices discarta a hipóstese de que os países tendem a compartilhar
+mais músicas com aqueles que também compartilham número similar de músicas. Entretanto, sendo a rede tão
+conexa como é, os efeitos de assortatividade/dessortatividade acabam sendo minimizados uma vez que
+"todo mundo se conecta com todo mundo".
+  
+#### **3.5 - Node-Level Indicies**
+```{r echo=TRUE, warning=FALSE, graph_Nlis, include=TRUE, fig.align="center", out.width="100%"}
+# Rotina que computa diversas medidas associadas a cada vértice do grafo
+graph_nlis = function(g, use.loops, has.directions, has.weights) {
+  
+  # Centralidade de Grau dos vértices do grafo
+  # . Simplesmente o número de vizinhos/vértices adjacentes de cada vértice do grafo
+  node_degree = degree(g, loops=use.loops, mode="all", normalized=T)
+  
+  # Centralidade do autovetor dos vértices do grafo
+  # . Nem todos os vértices de uma rede são equivalentes, alguns são mais
+  # importantes do que outros. Sendo assim, um vértice que estabelece algum
+  # tipo de relação com  um outro vértice "importante" da rede merece atenção
+  # se comparada com as demais.
+  node_egvc = eigen_centrality(g, directed=has.directions, scale=T)
+  
+  # Centralidade de Page Rank dos vértices do grafo
+  #
+  # . Um problema com a medida de centralidade de autovetor é que se um vértice
+  # com alta centralidade referencia muitos outros, então estes últimos por sua
+  # vez também terão um alta centralidade. Porém, é razoável pensar que vértices
+  # referenciados por outros altamente centrais são de menor importância: o ganho
+  # de centralidade do referenciado deve ser menosprezado se quem o referencia,
+  # referencia também vários outros. Assim, a cálculo da centralidade Page Rank
+  # leva em consieração o número de arestas indicentes ao vértice, a propensão
+  # daquele que referencia, e por fim o valor da sua centralidade.
+  #
+  # . Simulações sugerem o valor 0.85 para o parâmetro 'damping' do Page Rank.
+  node_pgrk = page_rank(g, vids=V(g), directed=has.directions, damping = 0.85)
+  
+  # Centralidade de Kleingberg dos vértices do grafo
+  #
+  # . É razoável assumir que um vértice também é importante por referenciar
+  # outros vértices importantes da rede. Em redes de co-autorias, por exemplo,
+  # artigos podem referenciar vários outros os quais julgam sere 'autoridades'
+  # no assunto e por isso, podem ser vistos como importantes. Seguindo essa
+  # lógica, é natural dividirmos os atores de uma rede em duas categorias:
+  # os 'chefes', que são referenciados por muitos outros, e aqueles
+  # 'subordinados', que apontam para os 'chefes'.
+  node_klgbr = authority.score(g, scale = T)
+  
+  # Centralidade de Proximidade dos vértices do grafo
+  #
+  # . Computa a distância média que um vértice possui dos demais, retornando
+  # valores menores para os vértices que estão separados por uma curta
+  # distância geodésica. Vértices com essa característica possuem um melhor
+  # acesso a informação dissipada na rede. Em redes sociais, atores com maiores
+  # índices de centralidade de proximidade são mais propícios a influenciar os
+  # demais vértices.
+  node_clo = closeness(g, mode = "all", normalized = T)
+  
+  # Centralidade de Intermediação dos vértices do grafo
+  #
+  # . Quantifica o quão provável um dado vértice é de intermediar a ligação
+  # entre outros dois vértices. Nesse sentido, vértices com alto índice de
+  # intermediação influenciam diretamente no fluxo de informação pela rede.
+  # Analagomente, estes são aqueles cuja remoção da rede irá pertubar a
+  # comunição inter-vértices.
+  node_btw = betweenness(g, directed = has.directions, normalized = T)
+  
+  # Tabela com as medidas de centralidade de cada vértice da rede
+  Degree = list(node_degree) %>% unlist() %>% as.numeric()
+  EigenVec = list(node_egvc$vector) %>% unlist() %>% as.numeric()
+  PageRank = list(node_pgrk$vector) %>% unlist() %>% as.numeric()
+  Kleinberg = list(node_klgbr$vector) %>% unlist() %>% as.numeric()
+  Closeness = list(node_clo) %>% unlist() %>% as.numeric()
+  Betweenness = list(node_btw) %>% unlist() %>% as.numeric()
+  Centrality_Table = as.data.frame(
+    cbind(Degree,EigenVec,PageRank,Kleinberg,Closeness,Betweenness)
+  )
+  rownames(Centrality_Table) = V(g)$name
+  
+  # Retorna a tabela
+  list("Node_Centrality_Table" = Centrality_Table) %>% return()
+  
+}
+graph_nlis = compiler::cmpfun(graph_nlis)
+g_nlis = graph_nlis(spotify_graph,F,F,T)$Node_Centrality_Table
+
+# Tabela com as medidas de centralidade
+kableExtra::kable(g_nlis) %>%
+  kableExtra::kable_styling() %>%
+  kableExtra::scroll_box(width = "100%", height = "400px")
+```
+
+- **Irrelevância da medida de Centralidade de Grau**. Tal fato já era esperado uma vez que
+o número de vértices adjacentes é sempre igual a 50, haja vista que todos os países compartilham
+pelo menos uma música no seu Top 50 com todos os demais outros.
+  
+- **Similaridade das medidas de Centralidade de Autovetor, PageRank e Kleinberg**. Analisando a tabela,
+percebe-se uma ordenação similar dos países com base em seus scores de centralidade nestas três medidas.
+Entretanto, é interessante notar uma similaridade dos scores atribuídos com o gráfico da figura 3.2, de
+forma que os países os quais mais compartilham músicas em playlist são também aqueles mais centrais.
+Este é um fato um tanto que curioso, pois as medidas de *Kleinberg* e *PageRank* "penalizam" aqueles
+vértices que referenciam muitos outros, bem como as conexões advindas destes.
+
+- **Paraguai, Brasil e Túrquia, nesta ordem, como os países mais influenciadores**. Vértices com alta
+centralidade de proximidade tendem a ser aqueles que possuem melhor acesso à informação e maior influência
+sobre os demais vértices. Sendo assim, uma das interpretações possíveis é que o gosto musical dests países
+são aqueles que melhor "resumem" as preferências de seus países vizinhos, no sentido de possuir uma playlist
+"bem aceita por todos". Alternativamente, pode-se pensar nestes países como sendo aqueles que mais estão em
+sincronia com as músicas "em alta do momento". Deixa-se aqui uma ressalva associada a dificuldade de
+interpretação associada a centralidade de proximidade conforme exposto em: *https://www.sci.unich.it/~francesc/teaching/network/closeness.html*.
+
+- **Paraguai, Japão e Brasil, nesta ordem, como os países com maior controle de informação**. A centralidade
+de intermediação é uma medida que quantifica quão frequentemente um vértice ocupa o caminhos entre os demais
+vértices. Nesse sentido, podemos pensar que a remoção dos países supracitados da rede reduziria, em média, o
+número de músicas compartilhadas entre todos os países. Curioso em notar mais uma vez a similaridade de
+ordenação dos países entre duas medidas de centralidade distintas (centralidade de proximidade e intermediação).
+
+#### **3.6 - Comunity-Detection Analysis**
+```{r, graph_cda, include=TRUE, echo=TRUE, warning=FALSE, fig.align="center", out.width="100%"}
+# Rotina que implementa diversos algoritmos para detecção de comunidades
+graph_cda = function(g, use.loops, has.directions, has.weights) {
+  
+  # Maximização de Modularidade
+  # 
+  # . A identificação de comunidades de atores em uma rede é feita com base na
+  # maximização de uma medida determinada "modularidade". Tal medida computa a
+  # diferença entre o número de arestas que ocorrem entre vértices de uma mesma
+  # comunidade diminuída e o número esperado de arestas entre os mesmos no caso
+  # de uma disposição aleatória dos vértices pela rede. Nesse sentido, tal medida
+  # assume valores positivos se existem mais arestas conectando vértices "de um
+  # mesmo tipo" do que o esperado e valores negativos caso contrário.
+  
+  # Método Fast-Greedy
+  # 
+  # . Método de abordagem hierárquica, aglomerativo, que atua diretamente na
+  # otimização da função modularidade associada a rede. Por ser aglomerativo,
+  # o algoritmo inicia com cada nó em uma comunidade separada, e mescla
+  # iterativamente as mesmas. Cada fusão é sempre localmente ótima e o algoritmo
+  # termina quando não é mais possível aumentar a modularidade.
+  #
+  # . O método tem como vantagem a sua velocidade sendo geralmente tentado como
+  # uma primeira aproximação por não possuir parâmetros ajustáveis (como no K-Means,
+  # por exemplo). No entanto, sabe-se o método sofre de um limite de resolução,
+  # isto é, comunidades abaixo de um determinado limite (threshold) de tamanho
+  # serão sempre mescladas com comunidades vizinhas.
+  fast_greedy = cluster_fast_greedy(g, merges = T, membership = T)
+  V(g)$fast_greedy = fast_greedy$membership
+  
+  # Método do Autovetor Líder
+  #
+  # . Método de abordagem hierárquica, divisivo, que otimiza a função de
+  # modularidade com base na avaliação do autovetor associado ao maior autovalor
+  # da chamada matriz de modularidade. Por envolver cálculos de autovetored,
+  # tal método pode não funcionar em gráficos degenerados.
+  #
+  # . A vantagem deste algortimo é que para grafos não degenerados, este atinge
+  # um score de modularidade geralmente maior do que outros métodos (Fast-Greedy,
+  # pode exemplo), porém ao custo de ser mais lento. O algortimo agrupa os vértices
+  # da rede baseando-se nos sinais das entradas do autovetor calculado, de forma 
+  # que caso todas as entradas do autovetor sejam de mesmo sinal, a rede possui
+  # estruturação única.
+  egv_comunnity = cluster_leading_eigen(g, steps = 10, callback = NULL)
+  V(g)$egv_comunnity = egv_comunnity$membership
+  
+  # Método da Caminhanda Aleatória
+  #
+  # .Tenta encontrar comunidades em um grafo com base no sorteio aleatório de
+  # camminhos entre os vértices. A premissa do método é que caminhadas curtas
+  # tendem a permanecer na mesma comunidade.
+  rdm_walk = cluster_walktrap(g, steps = 10, modularity = T, merges = T)
+  V(g)$rdm_walk = rdm_walk$membership
+  
+  # Retorna os grafos associados a cada algoritmo de clusterização
+  g_layout = layout_randomly(g, dim = 2)
+  
+  n_clusters = as.factor(V(g)$fast_greedy) %>% levels() %>% as.numeric() %>% max()
+  g_colors = RColorBrewer::brewer.pal(n_clusters, name = "Set1")
+  plot.igraph(g, main = "Fast Greedy Algorithm", vertex.shape = "circle", 
+              vertex.color = g_colors[V(g)$fast_greedy], vertex.size = 20,
+              vertex.label = V(g)$name, vertex.label.font = 1, vertex.label.cex = 0.6,
+              vertex.label.color = "Black", edge.color = "Grey", edge.width = 0.5,
+              edge.lty = 1, layout = g_layout)
+  
+  n_clusters = as.factor(V(g)$egv_comunnity) %>% levels() %>% as.numeric() %>% max()
+  g_colors = RColorBrewer::brewer.pal(n_clusters, name = "Set1")
+  plot.igraph(g, main = "Leading Eigen Vector Algorithm", vertex.shape = "circle", 
+              vertex.color = g_colors[V(g)$egv_comunnity], vertex.size = 20,
+              vertex.label = V(g)$name, vertex.label.font = 1, vertex.label.cex = 0.6,
+              vertex.label.color = "Black", edge.color = "Grey", edge.width = 0.5,
+              edge.lty = 1, layout = g_layout)
+  
+  n_clusters = as.factor(V(g)$rdm_walk) %>% levels() %>% as.numeric() %>% max()
+  g_colors = RColorBrewer::brewer.pal(n_clusters, name = "Set1")
+  plot.igraph(g, main = "Random Walk Algorithm", vertex.shape = "circle", 
+              vertex.color = g_colors[V(g)$rdm_walk], vertex.size = 20,
+              vertex.label = V(g)$name, vertex.label.font = 1, vertex.label.cex = 0.6,
+              vertex.label.color = "Black", edge.color = "Grey", edge.width = 0.5,
+              edge.lty = 1, layout = g_layout)
+  
+  # Tabela com as informações dos algoritmos
+  Membership_Table = as.data.frame(
+    cbind(V(g)$name, fast_greedy$membership, egv_comunnity$membership, rdm_walk$membership)
+  )
+  colnames(Membership_Table) = c("Vertex Label","Fast-Greedy","Leading Eigen", "Random Walk")
+  
+  # Retorna as informações
+  list("Fast_Greedy" = fast_greedy,
+       "Lead_Eigen" = egv_comunnity,
+       "Random_Walk" = rdm_walk,
+       "Membership_Table" = Membership_Table) %>% return()
+  
+}
+graph_cda = compiler::cmpfun(graph_cda)
+
+# Resultados
+g_cda = graph_cda(spotify_graph,F,F,T)
+```
+
+- **Agrupamento único dos países**. Os três algoritmos propêm o mesmo agrupamento de países na rede.
+
+- **Curiosa similaridade dos os agrupamentos com a língua falada**. Em um cluster, ficam praticamente
+agrupados todos os países latino-americanos.
+
+#### **3.7 - Visualizações**
+```{r, graph_viz, include=TRUE, echo=TRUE, warning=FALSE, fig.align="center", out.width="100%"}
+# Grafos estáticos
+dh_layout = layout_with_dh(spotify_graph)
+plot.igraph(spotify_graph, main="Davidson-Harrel Layout", vertex.size=20,
+            vertex.color=RColorBrewer::brewer.pal(9, "Set1")[2], vertex.frame.color="black",
+            vertex.shape="circle", vertex.label=V(spotify_graph)$name, vertex.label.font=2,
+            vertex.label.cex=0.6, vertex.label.dist=0, vertex.label.color="black",
+            edge.color="darkgrey", edge.width=0.5, edge.lty=1, edge.label=NA, layout=dh_layout)
+
+fr_layout = layout_with_fr(spotify_graph, dim = 2)
+plot.igraph(spotify_graph, main="Fruchterman-Reingold Layout", vertex.size=20,
+            vertex.color=RColorBrewer::brewer.pal(9, "Set1")[3], vertex.frame.color="black",
+            vertex.shape="circle", vertex.label=V(spotify_graph)$name, vertex.label.font=2,
+            vertex.label.cex=0.6, vertex.label.dist=0, vertex.label.color="black",
+            edge.color = "darkgrey", edge.width=0.5, edge.lty=1, edge.label=NA, layout=fr_layout)
+
+kk_layout = layout_with_kk(spotify_graph, dim = 2)
+plot.igraph(spotify_graph, main="Kamada-Kawai Layout", vertex.size=20, 
+            vertex.color=RColorBrewer::brewer.pal(9, "Set1")[4], vertex.frame.color="black",
+            vertex.shape="circle", vertex.label=V(spotify_graph)$name, vertex.label.font=2,
+            vertex.label.cex=0.6, vertex.label.dist=0,  vertex.label.color="black",
+            edge.color="darkgrey", edge.width=0.5, edge.lty=1, edge.label=NA, layout=kk_layout)
+
+lgl_layout = layout_with_lgl(spotify_graph)
+plot.igraph(spotify_graph, main="Large-Graph Layout", vertex.size=20,
+            vertex.color=RColorBrewer::brewer.pal(9, "Set1")[5], vertex.frame.color="black",
+            vertex.shape="circle", vertex.label=V(spotify_graph)$name, vertex.label.font=2,
+            vertex.label.cex=0.6, vertex.label.dist=0, vertex.label.color="black",
+            edge.color="darkgrey", edge.width=0.5, edge.lty=1, edge.label=NA, layout=lgl_layout)
+
+opt_layout = layout_with_graphopt(spotify_graph)
+plot.igraph(spotify_graph, main="Graph-Opt Layout", vertex.size=20,
+            vertex.color=RColorBrewer::brewer.pal(9, "Set1")[1], vertex.frame.color="black",
+            vertex.shape="circle", vertex.label=V(spotify_graph)$name, vertex.label.font=2,
+            vertex.label.cex=0.6, vertex.label.dist=0, vertex.label.color="black",
+            edge.color="darkgrey", edge.width=0.5, edge.lty=1, edge.label=NA, layout=opt_layout)
+```
+
+**Davidson-Harrel Layout:**
+- Ron Davidson, David Harel: Drawing Graphs Nicely Using Simulated Annealing. ACM Transactions on Graphics 15(4), pp. 301-331, 1996.
+
+**Fructherman-Reingold Layout:**
+Fruchterman, T.M.J. and Reingold, E.M. (1991). Graph Drawing by Force-directed Placement. Software - Practice and Experience, 21(11):1129-1164.
+
+**Graph-Opt Layout:**
+Michael Schmuhl for the original graphopt code, rewritten and wrapped by Gabor Csardi csardi.gabor@gmail.com.
+
+**Kamada-Kawai Layout:**
+Kamada, T. and Kawai, S.: An Algorithm for Drawing General Undirected Graphs. Information Processing Letters, 31/1, 7–15, 1989.
+
+**Large-Graph Layout:**
+Gabor Csardi csardi.gabor@gmail.com
+
+## **4. Escalonamento Multidimensional**
+De uma forma geral, o objetivo do Escalonamento Multidimensional é projetar um conjunto de dados
+num sistema de coordenadas de baixa dimensão de tal forma que toda a distorção causada pela redução
+de dimensionalidade seja mínima. Essa distorção geralmente se refere às similaridades ou
+dissimilaridades (distâncias) entre os pontos de dados originais.
+            
+Nesse sentido, a credibilidade deste método sustenta-se no fato de que a representação gráfica,
+simplificada, de dados multivariados, possibilita uma inspeção visual direta e relevante acerca dos dados.
+
+Formalmente, dado um conjunto de similaridades observadas (ou distâncias) entre cada par de $N$ itens,
+deve-se encontrar uma disposição dos mesmos em alguma dimensão *q* (onde $q \le  N - 1$) tal que as
+proximidades entre os itens de *q* fiquem o mais próximo possível das proximidades (ou distâncias) originais.
+
+Para $N$ itens, existem $M = N (N - 1) / 2$ similaridades (distâncias) entre pares de itens diferentes.
+Estas similaridades constituem os dados básicos e podem ser organizadas em uma ordem estritamente ascendente como: $s_{i_1,k_1}<s_{i_2,k_2}<...<s_{i_M,k_M}$, onde $s_{i_1,k_1}$ é a menor das $M$ similaridades. O subscrito
+$i_1,k_1$ indica o par de itens que são menos similares. Os outros índices são interpretados da mesma maneira.
+
+Quando se deseja organizar estes $N$ itens em um sistema de baixa dimensão de coordenadas utilizando
+apenas os postos das $N (N - 1) / 2$ similaridades originais (distâncias), e não as suas magnitudes,
+o processo é chamado de *Escalonamento Multidimensional não métrico*. Se as grandezas reais das similaridades
+originais (distâncias) são utilizadas para obter uma representação geométrica em $q$ dimensões, o processo é
+chamado de *Escalonamento Multidimensional métrico*. Vale mencionar que este último é também conhecido
+como *Análise de Componentes* *Principais * ou também *Escalonamento Multidimensional Clássico*.
+            
+Na forma de um algoritmo, o Escalonamento Multidimensional inicia com uma matriz de distâncias ${\bf D}$
+com elementos $d_{ij}$, onde $i,j= 1,....N$, e o objetivo é encontrar uma configuração de pontos no
+espaço $p$-dimensional, a partir das distâncias entre os pontos, de tal forma que as coordenadas dos $n$ pontos,
+ao longo da dimensão $p$, produza uma matriz de distâncias Euclidianas, cujos elementos estejam tão próximos
+quanto possível dos elementos da matriz de distâncias ${\bf D}$. No método clássico, a matriz de
+dissimilaridades é assumida como uma matriz de distâncias.
+
+As coordenadas principais, usando as distâncias Euclidianas como dissimilaridades, são obtidas a partir
+dos seguintes passos:
+
+1. A partir da matriz de dados, calcular as distâncias Euclidianas entre as linhas.
+
+2. A partir da matriz de distâncias Euclidianas, construir a matriz $A$, da seguinte maneira:
+$a_{ij}=-1/2 d^{2}_{ij}$, onde $d^{2}_{ij}$ representa o quadrado da distância euclidiana entre
+as similaridades dos itens $i$ e $j$.
+
+3. Construir a matriz $B$, da seguinte maneira:
+
+$$
+b_{ij}=a_{ij}-\overline{a}_{i.}-\overline{a}_{.j}+\overline{a}_{..},
+\\
+\text{onde:}
+\\
+\overline{a}_{i.}=\sum\limits_{j=1}^{N} a_{ij}/N, \overline{a}_{.j}=\sum\limits_{i=1}^{N} a_{ij}/N e \overline{a}_{..}=\sum\limits_{i=1}^{N} \sum\limits_{j=1}^{N} a_{ij}/N^{2}
+$$
+4. Selecionar os $p$ autovalores positivos da matriz $B$, de modo que
+$\lambda_{1} \ge... \ge \lambda_{p}>\lambda_{p+1}=...=\lambda_{N}=0$, e seus autovetores associados
+${\bf V}=[{\bf V}_{1},...,{\bf V}_{p}]$, obtendo-se, então, em $p$ dimensões, a solução das coordenadas
+principais ${\bf X}_{i} = {\bf V}_{i} \sqrt{\lambda_i}$, onde $i=1,...,p$ e cada ${\bf X}_{i}$ é um
+vetor de dimensão $N \times 1$.
+
+5. Caso $p$ seja grande, de pouco interesse prático e se queira obter uma representação em $q<p$ dimensões,
+basta selecionar os $q$ primeiros autovalores, de modo que 
+$\lambda_{1} \ge... \ge \lambda_{q} \ge... \ge \lambda_{p}>\lambda_{p+1}=...=\lambda_{N}=0$.
+Obtém-se, em $q$ dimensões, a solução das coordenadas principais ${\bf X}_{i} = {\bf V}_{i} \sqrt{\lambda_i}$, onde $i=1,...,q$ e cada ${\bf X}_{i}$ é um vetor de dimensão $N \times 1$.
+
+Por fim, uma característica interessante do Escalonamento Multidimensional é que as soluções para
+diferentes dimensões estão agrupadas, isto é, as duas primeiras dimensões de uma solução com 3 dimensões
+são iguais à solução de duas dimensões. O número de dimensões desejado normalmente é o mais baixo possível
+de forma a proporcionar interpretações práticas.
+
+```{r mds_fit, echo=TRUE, message=FALSE, warning=FALSE, fig.align="center", out.width="100%"}
+# Função que implementa o Escalonamento Multidimensional
+mds_fit = function(socio_mat, is.directed=F, use.loops=F, use_cor_mat=F) {
+  
+    if(isTRUE(use_cor_mat)) {
+      
+      # Computa o Escalonamento Multidimensional com a matriz de correlações
+      mds_fit = dist(cor(socio_mat), method="euclidean", diag=use.loops, upper=isFALSE(is.directed)) %>%
+        cmdscale(k=2) %>%
+        as.matrix()
+      
+      # Nomeia as colunas
+      colnames(mds_fit) = c("x_cords","y_cords")
+    
+      # Obtenção do grafo como uma derivação da sócio-matriz
+      # . Redução do número de arestas plotadas para melhor legibilidade do grafo
+      # . Cada aresta plotada representa 10 relacionamentos entre os vértices i e j
+      g = graph.adjacency(as.matrix(round(socio_mat/10),0),
+                          mode=ifelse(isTRUE(is.directed),"directed","undirected"),
+                          diag=use.loops)
+    
+      # Grafo resultante
+      plot.igraph(g, main="Multidimensional Scaling - Correlation Social Matrix", vertex.size=20,
+                  vertex.color="orange", vertex.shape="circle",
+                  vertex.label=colnames(socio_mat), vertex.label.font=2, vertex.label.cex=0.6,
+                  vertex.label.dist=0, vertex.label.color="black", edge.color="grey",
+                  edge.width=0.3, edge.lty=1, layout=mds_fit)
+
+      # Retorna as posições estimadas
+      list("par"=mds_fit) %>% return()
+
+    } else {
+      
+      # Computa o Escalonamento Multidimensional com a matriz original
+      mds_fit = dist(socio_mat, method="euclidean", diag=use.loops, upper=isFALSE(is.directed)) %>%
+        cmdscale(k=2) %>%
+        as.matrix()
+      
+      # Nomeia as colunas
+      colnames(mds_fit) = c("x_cords","y_cords")
+    
+      # Obtenção do grafo como uma derivação da sócio-matriz
+      # . Redução do número de arestas plotadas para melhor legibilidade do grafo
+      # . Cada aresta plotada representa 10 relacionamentos entre os vértices i e j
+      g = graph.adjacency(as.matrix(round(socio_mat/10),0),
+                          mode=ifelse(isTRUE(is.directed),"directed","undirected"),
+                          diag=use.loops)
+
+      # Grafo resultante
+      plot.igraph(g, main="Multidimensional Scaling", vertex.size=20,
+                  vertex.color="yellow", vertex.shape="circle",
+                  vertex.label=colnames(socio_mat), vertex.label.font=2, vertex.label.cex=0.6,
+                  vertex.label.dist=0, vertex.label.color="black", edge.color="grey",
+                  edge.width=0.3, edge.lty=1, layout=mds_fit)
+
+      # Retorna as posições estimadas
+      list("par"=mds_fit) %>% return()
+      
+    }
+    
+}
+mds_fit = compiler::cmpfun(mds_fit)
+
+# Resultados
+spotify_mds = mds_fit(social_matrix,F,F,F)
+spotify_mds_cor = mds_fit(social_matrix,F,F,T)
+```
+
+- **Semelhança do Escalonamento Multidimensional com os algortimos de clusterização**. Comparando a disposição
+da rede obtida com o os agrupamentos produzidos pelos algortimos de clusterização, fica clara a separação dos
+países latino-americanos
+
+- **Sútil diferença com o uso da sócio-matriz de correlações**. De fato, o uso da sócio-matriz de correlações
+pouco influenciou na disposição dos países da rede. Tal fato ocorre, na verdade, por uma peculiaridade da
+rede: o fato de todos os países compartilharem músicas em suas playlists uns com os outros, minimiza o viés
+observado com a matriz de adjacência valorada. Apesar de não ser significante, o uso da sócio-matriz de
+correlações aparenta melhor diferenciar os relacionamentos entre os artistas (aglomerados de países mais 
+"compactos").
+
+## **5. Modelo de Distâncias Latentes**
+O Modelo de Distâncias Latentes *Hoff et al., 2002* e *Handcock et al., 2007* considera que cada um dos $n$
+elementos da rede assume uma posição em um espaço latente definido em $\Re^d$, onde geralmente $d = 1, 2$ ou $3$.
+            
+Neste modelo, tradicionalmente, interpreta-se a existência (ou não) de uma relação entre os elementos da rede a partir
+de uma distribuição Bernoulli. Entretanto, o caráter dicotômico da distribuição Bernoulli, não se aplica ao contexto
+da nossa base de dados. Destarte, as relações entre os indivíduos $i$ e $j$, no contexto da nossa rede, seriam melhor captadas assumindo-se uma distribuição Poisson com taxa $\lambda_{ij}$, onde $\lambda_{ij} \in [0,1,2, ..., \infty)$.
+
+O modelo assume ainda que as probabilidades de uma conexão entre os elementos $i$ e $j$ dependem da distância
+entre os mesmos no referido espaço latente. Sendo assim, formalmente, o modelo fica então especificado da
+seguinte forma:
+
+$$
+[Y_{i,j} \mid \lambda_{i,j}] \sim Pois(\lambda_{i,j})
+\\
+ln(\lambda_{i,j}) = \theta - |a_i - a_j|,
+\\
+\forall \ i \leq j
+$$
+
+Os efeitos latentes ${\bf a}=(a_1,...,a_n)'$ representam as localizações ou coordenadas que os diferentes elementos
+da rede ocupam no espaço latente $\Re^d$. Assim, elementos que ocupam posições (ou localizações) próximas no espaço
+latente apresentam maior probabilidade de compartilharem uma relação em comparação com elementos cujas posições (ou localizações) no espaço latente não são próximas.
+
+As localizações no espaço latente associadas a cada um dos elementos da rede social são parâmetros a serem estimados
+pelo modelo e podem ser definidos para um número arbitrário de dimensões. Por razões de parcimônia e a fim de se
+produzir resultados mais facilmente interpretáveis, baixas dimensões costumam ser escolhidas *Hoff et al., 2002*.
+Tais localizações (coordenadas), são obtidas mediante Escalonamento Multidimensional.
+
+Apesar desta flexibilidade aparente, em geral boas representações são obtidas em espaços latentes de até duas
+dimensões. Além de também permitir a realização de uma análise de agrupamentos, identificados pela proximidade
+espacial, este modelo fornece uma excelente visão gráfica dos padrões de relacionamento da rede social.
+            
+Finalmente, o processo de inferência para este modelo utiliza a abordagem bayesiana, a partir dos métodos
+de **Máxima Verossimilhança** e o **Método de Monte Carlo via Cadeias de Markov (MCMC)**. Estes e mais alguns
+outros serão descritos em mais detalhes (porém ainda superficialmente) abaixo:
+
+#### **5.1 - Máxima Verossimilhança:**
+Para estimação dos parâmetros (localizações) desconhecidos do Modelo de Distâncias Latentes, um dos métodos
+tradicionais é a Estimação por Máxima Verossimilhança (EMV). De forma geral, o objetivo de uma EMV é encontrar
+valores aos parâmetros desconhecidos que maximizem uma função objetivo especifica, 
+denominada **função de verossimilhança**.
+            
+A função de verossimilhança contempla toda a informação de uma amostra $\bf{x}$, de um vetor aleatório $\bf{X}$,
+associado a um parâmetro $\theta$. Essa função pode ser expressa por $p({\bf x} \mid \theta)$, que associa cada
+valor de $\theta$ à probabilidade de $\bf{x}$ ser observado.
+            
+Supondo uma amostra de tamanho $n$ e independência entre cada variável aleatória $X_i$, $i=1,...,n$ pode-se então
+estabelecer a seguinte relação entre a função de verossimilhança e a probabilidade de se observar cada $x_i$:
+$p({\bf x}\mid\theta)= \displaystyle \prod_{i=1}^{n} p(x_i\mid\theta)$.
+            
+Assim, partindo da especificação apresentada do modelo, temos de o equivalente: 
+
+$$
+[Y_{i,j} \mid \lambda_{i,j}] \sim Pois(\lambda_{i,j})
+\\
+ln(\lambda_{i,j}) = \theta - |a_i - a_j|, \quad  \forall\quad{i<j}, \  \lambda_{ij} = 0,1,2,3,...
+\\
+$$
+Obtendo-se então a seguinte função de verossimilhança associada:
+
+$$
+p({\bf y} \mid \theta, {\bf a}) =\prod_{i<j} \left( \frac{{\exp(\theta - |a_i - a_j|)}^{y_{i,j}}{\exp(-\exp(\theta - |a_i - a_j|))}}{y_{i,j}!}\right),\quad onde \quad y_{i,j} = 0,1,2,3,..., \quad 1<i<j<n.
+$$
+
+No intuito de simplificar os cálculos, uma alternativa comumente utilizada é considerar como função objetivo
+a função de log-verossimilhança negativa, uma vez que maximizar a função de verossimilhança é o mesmo que
+minimizar a função de log-verossimilhança negativa.
+
+#### **5.2 - Inferência Bayesiana:**
+As conclusões obtidas através da Inferência Bayesiana, a respeito de um determinado parâmetro $\theta$,
+ou de uma variável não observada $\bf{y}$, são baseadas em especificações probabilísticas. Tais
+especificações são feitas condicionalmente a uma amostra de valores observados, sendo esta relacionada
+de alguma forma com as quantidades de interesse.
+            
+Matematicamente, todo o processo de Inferência Bayesiana consiste na atualização da informação obtida
+*a priori* com base em um teorema denominado **Teorema de Bayes**. A partir deste é que obtêm-se a distribuição
+*a posteriori* do(s) parâmetro(s) de interesse mesclando a distribuição *a priori* com a função de
+verossimilhança associado ao modelo.
+        
+A distribuição *a priori* contempla a incerteza a respeito de $\theta$ (vetor de parâmetros desconhecidos
+que pertence ao espaço paramétrico $\Theta$), condicionalmente a $H$ (informação inicial acerca de alguma
+quantidade de interesse). Denotaremos aqui esta informação por $p(\theta|H)$.
+
+Por sua vez, a distribuição *a posteriori* atualiza a informação inicial sobre uma quantidade de interesse
+com base na informação da amostra $\bf{x}$. A informação disponível para a inferência passará a ser
+$H^{*}=H\cap \left \{ {\bf X = x} \right \}$. Denotaremos esta informação por $p(\theta|H^{*})$. É importante
+ressaltar a importância da distribuição *a posteriori* na Inferência Bayesiana: segundo *Migon e Gamerman (1999)*,
+é através dela a forma mais adequada de avaliar a informação disponível a respeito de uma quantidade desconhecida
+$\theta$.
+
+$$
+p(\theta|H^{*}) = p(\theta|{\bf x},H) = \frac{p(\theta,{\bf x}|H)}{p({\bf x}|H)} = \frac{p({\bf x}|\theta,H)p(\theta|H)}{p({\bf x}|H)}
+$$
+
+Acima, $p(\theta|H)$ e $p(\theta|H^{*})$ representam as distribuições *a priori* e *posteriori*,
+respectivamente, e $$p({\bf x}|H)=\int p(\theta,{\bf x}|H)d\theta.$$
+
+Como $p({\bf x}|H)$ não depende de $\theta$ e sendo $H$ é comum a todos os termos, pode-se reescrever
+o teorema da seguinte forma: $p(\theta|{\bf x})\propto p({\bf x}|\theta)p(\theta)$.
+
+Assim, o resultado obtido em é então conhecido como Teorema de Bayes e se constitui como a base de todos os
+procedimentos da inferência Bayesiana. Na próxima subseção, será apresentado dentro do contexto da inferência
+bayesiana, o **Método de Monte Carlo via Cadeias de Markov (MCMC)** para estimação dos parâmetros.
+
+#### **5.3 - Método de Monte Carlo via Cadeia de Markov (MCMC):**
+Na Inferência Bayesiana, os métodos de simulação estocástica estão relacionados ao processo de obtenção
+de amostras das distribuições *a posteriori* quando as mesmas não possuem uma forma fechada. Estes
+métodos visam a estimação das distribuições *a posteriori* e, por conseguinte, das características
+probabilísticas de interesse. 
+
+Em problemas altamente complexos, em que se tem um grande número de parâmetros envolvidos, os métodos
+de *Monte Carlo via Cadeias de Markov* se tornam a solução para a conclusão do processo inferencial.
+
+Essencialmente, o objetivo do método é construir uma cadeia de Markov cuja distribuição de equilíbrio
+(também conhecida como distribuição limite) seja igual à distribuição de interesse. Para tal, realiza-se
+um número finito de simulações desta cadeia, de forma que a mesma eventualmente convirja e, a partir deste
+ponto, dê origem a uma amostra da distribuição de interesse.
+
+Se os parâmetros $\theta_1,...,\theta_p$ possuem densidade conjunta $p(\bf{\theta})$ = $p(\theta_1,...,\theta_p)$ e $q(\theta,\theta^{*})$ é a distribuição condicional das transições do estado $\theta$, dessa forma, é
+possível construir uma cadeia de Markov com probabilidades de transição invariantes no tempo, onde qualquer
+estado pode ser obtido a partir de um outro qualquer em um número finito de iterações. 
+            
+Assim, independentemente do estágio inicial da cadeia, uma trajetória pode ser gerada e, consequentemente,
+pode-se alcançar a distribuição de equilíbrio $p(\theta)$.
+
+Existem diversos métodos na literatura cujo objetivo é a construção da cadeia de Markov. Dentre os mais
+famosos, temos o Amostrador de Gibbs, proposto por *Geman e Geman (1984)* e popularizado por
+*Gelfand e Smith (1990)*, bem como o método de Metropolis-Hastings, proposto por
+*Metropolis  et al. (1953) e Hastings (1970)*.
+            
+No contexto desta análise, o método adotado para construção da cadeia adotado foi o de Metropolis-Hastings,
+pois este já encontra-se implementado no software *R* como sendo uma das rotinas do pacote *latentnet*.
+            
+Na forma de um algoritmo, o método de Metropolis-Hastings pode ser decomposto nas seguintes etapas:
+            
+1. Considerar $q(\theta,\cdot)$ como sendo um núcleo arbitrário de transição e assuma que na iteração
+$(j)$ a cadeia se encontra no estado $\theta^{(j)}$. Denote, a posição da cadeia na iteração $(j+1)$
+por $\theta^{(j+1)}$.
+
+2. Propor um movimento da cadeia para o estado $\theta^{*}$ a partir de $q(\theta^{(j)},\cdot)$.
+
+3. Aceitar o movimento proposto com probabilidade
+
+$$
+\alpha(\theta^{(j)},\theta^{(*)}) = min \{1,\frac{p(\theta^{*})/q(\theta^{(j)},\theta^{*})}{p(\theta^{(j)})/q(\theta^{*},\theta^{(j)})}\}
+$$
+
+e fazer $\theta^{(j+1)}=\theta^{*}$ ou rejeitar o movimento com probabilidade $1-\alpha(\theta^{(j)},\theta^{(*)})$,
+neste caso fazendo  $\theta^{(j+1)}=\theta^{(j)}$.
+            
+Após decidido o método a ser utilizado e obtida uma simulação da cadeia, devemos nos certificar acerca da sua
+convergência. Somente após esta confirmação poderemos formar a amostra da distribuição *a posteriori*
+das quantidades desconhecidas do modelo.
+            
+Dentre as mais variadas formas de se realizar uma análise de convergência, uma delas é a inspeção gráfica, onde se
+analisa a trajetória de uma ou mais cadeias em intervalos de tempo distintos.
+            
+Obtida a amostra, deve-se então analisar a autocorrelação existente entre $\theta^{(j)}$ e $\theta^{(j+1)}$.
+Como estamos lidando com uma amostra de uma cadeia de Markov, temos uma amostra aleatória, porém não independente.
+Isto não afeta as estimativas dos parâmetros, mas tem influência sobre as variâncias das estimativas resultantes.
+Portanto, nos casos em que, após verificada a convergência, for constatada uma forte correlação serial na cadeia, recomenda-se a retirada de uma amostra sistemática de seus valores para compor uma nova amostra. A forma como a
+amostragem sistemática será realizada pode ser baseada em um gráfico contendo a função de autocorrelação da cadeia.
+
+Finalmente, verificados todos estes itens, o processo de inferência tem prosseguimento a partir do método de
+Monte Carlo. O objetivo deste método é estimar o valor de uma integral a partir da obtenção de seu valor esperado
+associado a alguma distribuição de probabilidade. Para se obter, por exemplo, uma estimativa para o valor esperado
+*a posteriori* de um parâmetro $\theta$ do modelo, basta tomar a médias das j-ésimas componentes dos valores
+amostrados, ou seja: $$\hat{\theta}=\frac{\sum_{j}\,\theta_j}{n}.$$
+
+#### **5.4 - Máxima Densidade A Posteriori (MAP):**
+Em estatística bayseiana, uma estimativa de Máxima Densidade A Posteriori (MAP) nada mais é do que uma estimação
+pontual acerca de alguma quantidade desconhecida que no caso coincide com a moda da distribuição *a posteriori*.
+Como era de se esperar, esto possui grande similaridade com a estimativa de Máxima Verossimilhança, porém a sua
+diferença reside justamente na incorporação da distribuição *a priori* no processo de otimização.
+
+Suponha que desejamos estimar uma parâmetro populacional desconhecio $\bf{\theta}$ com base em uma amostra aleatória
+de uma variável $\bf{x}$. Seja $f$ a função de densidade de $\bf{x}$, de forma que $f(x \ | \ \theta)$ denote então a distribuição de probabilidade da variável $\bf{x}$ quando o parâmetro populacional de interesse é $\bf{\theta}$. De
+forma similar, suponha agora que exista também uma função $g(\theta)$ com domínio $\Theta$ *a priori*. Tal fato nos
+permite tratar também o parâmetro de interesse $\bf{\theta}$ como uma variável aleatória, de forma que podemos então
+obter a distribuição *a posteriori* de $\bf{\theta}$ com base no **Teorema de Bayes**:
+
+$$
+\theta \implies f(\theta | x) = \frac{f(x|\theta)g(\theta)}{\int_{\Theta}f(x|v)g(v)dv}
+$$
+Finalmente, o método da estimação por Máxima Densidade A Posteriori estima o parâmetro $\theta$ como sendo a moda
+da distribuição *a posteriori*:
+
+$$
+\hat{\theta_{MAP}}(x) = arg \ max (\theta) \ \frac{f(x|\theta)g(\theta)}{\int_{\Theta}f(x|v)g(v)dv} = arg \ max (\theta) \ f(x|\theta)g(\theta)
+$$
+uma vez que a distrbuição marginal não depende do parâmeto de interesse.
+
+#### **5.5 - Exponential Random Graph Mixed Models (ERGMM's):**
+De acordo com *S. Thiemichen et al. (2018)*, os modelos estatísticos voltados para dados de redes sociais
+podem ser, à grosso modo, generelizados em duas classes distintas:
+
+- **(a)** Aqueles em que os relacionamentos entre os atores da rede são funções de covariáveis externas
+ou de efeitos aleatórios latentes;
+
+- **(b)** Relacionamento entre os atores dependentes também de aspectos estruturais da rede.
+
+A primeira classe retratada em **a)**, deu origem aos modelos conhecidos pela literatura como $p1$ e
+$p2$, os quais remetem aos autores *Holland e Leinhardt (1981)*. Seja $\bf{Y}$ uma matriz de adjacência
+de dimensão $\bf{n \times n}$, onde cada elemento $y_{ij} = 1, \ \text{ou} \  \ y_{ij}= 0$ denotando a existência/não-existência de uma relação  entre os atores $i$ e $j$, respectivamente. Para efeito de
+simplicidade, assuma que a rede modela por $\bf{Y}$ é não-direcionada. Assim, os modelos $p1$ e $p2$
+ficam especificados como:
+
+$$
+logit[P(Y_{ij}=1)] = log \{\frac{P(Y_{ij}=1)}{1-P(Y_{ij}=1)}\}=\alpha_i +\alpha_j+z_{ij}^{t}\beta
+$$
+e
+
+$$
+logit[P(Y_{ij}=1|\phi)]=\phi_i + \phi_j + z_{ij}^{t}\beta
+\\
+\bf{\phi}=(\phi_1, \ .... \ , \phi_n)^{t} \sim N(0,\sigma_{\phi}^2I_n)
+$$
+onde $z_{ij}$ em ambos os modelos denotam possíveis covariáveis entre os vértices $i$ e $j$, $\alpha_i$ e
+$\alpha_j$ no modelo $p1$ denotando efeitos de atração/repulsividade entre os vértices $i$ e $j$ e o vetor
+coluna $\bf{\phi}$ denotando efeitos aleatórios latentes específicos à cada um nos n-ésimos vértices.
+
+O segundo grupo de modelos estatísticos voltados para redes sociais são os conhecidos como **Exponential**
+**Random Graph Models (ERGM)**, inicialmente proposto por *Frank e Strauss (1986)*, os quais abordam
+diretamente a existência/não-existência de relacionamentos entre os vértices $i$ e $j$ da rede diretamente
+pela sua função de verossimilhança associada:
+
+$$
+P(\bf{Y}=\bf{y} \ | \ \bf{\theta}) =  f(\bf{y} \ | \theta) = \frac{exp(\bf{\theta^t}s(y))}{k(\bf{\theta})}=\frac{exp(\bf{\theta^t}s(y))}{\sum_{y \in Y}exp(\theta^ts(y))}
+$$
+com $\bf{\theta} = (\theta_1, ...,\theta_p)^t$ denotando o vetor de parâmetros e $s(\bf{y})$ o vetor de
+estatísticas suficientes (geralmente estatística associadas aos vértices como grau, número de 2-estrelas,
+triângulos, etc...)
+
+O real "tradeoff" do modelo anterior, é que o termo normalizador $k(\theta)$, realiza uma ponderação do
+número de arestas existentes entre dados dois atores $i$ e $j$ da rede por **todas as configurações**
+**teoricamente possíveis** entre os memos, o que no caso de um grafo não direcionado, por exemplo,
+corresponde a soma de $2^{n \choose 2}$ arestas, inviável para a grande maioria dos grafos.
+
+Por fim, a estimação dos parâmetros do modelo acima são feitos geralmente dos já mencionados métodos
+bayesianos, contando também com o auxílio da aproximação númerica em alguns casos.
+
+#### **5.6 - Estimação Procrusteana:**
+As distâncias entre um conjunto de pontos no espaço euclidiano são sempre
+invariantes sob as operações de rotação, reflexão e tradução. Portanto,
+para cada matriz de posições latentes $\bf{Z}$, existirá sempre um número infinito
+de outras posições dando o mesmo valor de log-verossimilhança.
+
+Desta forma, uma região de confiança que incluí duas posições equivalentes,
+digamos, $Z_1$ e $Z_2$, estão de certa forma, subestimando a variabilidade nas
+posições latentes desconhecidas, uma vez que estas seriam idênticas à $Z_1$ e
+$Z_2$.
+
+Felizmente, esse problema pode ser resolvido através da realização de inferência
+em um conjunto denominado **classes de equivalência de posições latentes**, definido
+da seguinte forma:
+
+- Seja $\{Z\}$ o conjunto de posições equivalentes à matriz das posições latentes $\bf{Z}$
+sob as transformações lineares supracitadas. Com base nesta classes equivalentes,
+deriva-se um último conjunto de posições denominado **classe de equivalência**,
+que é a "configuração média" de todas as posições de $\{Z\}$. Refere-se também à
+esta classe de posições como **classe de configuração**.
+
+Por fim, uma vez obtida esta classe de equivalência, procede-se normalmente com os
+métodos de estimação por Máxima Verossimilhança ou Máxima Densidade A Posteriori.
+No pacote *latentnet*, obtêm-se esta classe de equivalência da seguinte forma
+atráveis da rotina *ergmm()* incializada com o parâmetro *to.fit="procrustes"*.
+
+```{r lmd_fit, echo=TRUE, message=FALSE, warning=FALSE, out.width="100%", fig.align="center"}
+# Rotina que implementa o Modelo de Distâncias Latentes
+ldm_fit = function(socio_mat, Is.direct=F, Is.Weighted=T, Has.Loops=F, to.fit=c("mle","pmode")) {
+  
+  # Estimação dos parâmetros do modelo por Máxima Verossimilhança
+  ldm_procrustean_mle_fit = function(socio_mat, Is.direct, Is.Weighted, Has.Loops) {
+    
+    # Objeto tipo network à ser manipulado pela função ergmm()
+    net_aux = network::network(
+      x = socio_mat,
+      directed = Is.direct,
+      loops = Has.Loops,
+      matrix.type = "adjacency"
+    )
+    
+    # Atribui pesos as arestas da rede (caso esta seja de fato valorada)
+    if (isTRUE(Is.Weighted)) {
+      network::set.edge.value(
+        x = net_aux,
+        attrname = "weight",
+        value = socio_mat
+      )
+    }
+    
+    # Valores iniciais do Escalonamento Multidimensional
+    par_vec = dist(
+      x = socio_mat,
+      method = "euclidean",
+      diag = Has.Loops,
+      upper = isFALSE(Is.direct)
+    ) %>% cmdscale(k=2) %>% as.vector()
+    par_vec[(length(par_vec)+1)] = 0
+    
+    # Estimação dos parâmetros
+    mle_fit = ergmm(
+      formula = net_aux ~ euclidean(d=2),
+      response = "weight",
+      family = "Poisson",
+      user.start = list(par_vec),
+      tofit = "procrustes",
+      # Modificaçãoes dos paramêtros do método MCMC
+      # . parâmetros padrão da rotina ergmm() não foram suficentes para convergência
+      control = control.ergmm(
+        sample.size = 8000,
+        burnin = 20000,
+        interval = 10,
+        threads = 4
+      )
+    )
+    
+    # Obtenção do grafo como uma derivação da sócio-matriz
+    # . Redução do número de arestas plotadas para melhor legibilidade do grafo
+    # . Cada aresta plotada representa 10 relacionamentos entre os vértices i e j
+    g = graph.adjacency(
+        adjmatrix = as.matrix(round(socio_mat/10),0),
+        mode = ifelse(isTRUE(Is.direct),"directed","undirected"),
+        diag = Has.Loops
+    )
+    
+    # Grafo resultante
+    plot.igraph(
+      g, main="Latent Distances Model - Procrustean MLE Estimation", vertex.size=20,
+      vertex.color="light green", vertex.shape="circle", vertex.label=colnames(socio_mat),
+      vertex.label.font=2, vertex.label.cex=0.7, vertex.label.dist=0,
+      vertex.label.color="black", edge.color="grey", layout=mle_fit$mcmc.mle$Z
+    )
+
+    # Retorna as informações
+    return(list("output"=mle_fit, "par"=mle_fit$mcmc.mle$Z))
+    
+  }
+  
+  # Estimação dos parâmetros do modelo por Máxima A Posteriori
+  ldm_procrustean_map_fit = function(socio_mat, Is.direct, Is.Weighted, Has.Loops) {
+    
+    # Objeto tipo network à ser manipulado pela função ergmm()
+    net_aux = network::network(
+      x = socio_mat,
+      directed = Is.direct,
+      loops = Has.Loops,
+      matrix.type = "adjacency"
+    )
+    
+    # Atribui pesos as arestas da rede (caso esta seja de fato valorada)
+    if (isTRUE(Is.Weighted)) {
+      network::set.edge.value(
+        x = net_aux,
+        attrname = "weight",
+        value = socio_mat
+      )
+    }
+    
+    # Valores iniciais do Escalonamento Multidimensional
+    par_vec = dist(
+      x = socio_mat,
+      method = "euclidean",
+      diag = Has.Loops,
+      upper = isFALSE(Is.direct)
+    ) %>% cmdscale(k=2) %>% as.vector()
+    par_vec[(length(par_vec)+1)] = 0
+    
+    # Estimação dos parâmetros
+    map_fit = ergmm(
+      formula = net_aux ~ euclidean(d=2),
+      response = "weight",
+      family = "Poisson",
+      user.start = list(par_vec),
+      tofit = "procrustes",
+      # Modificaçãoes dos paramêtros do método MCMC
+      # . parâmetros padrão da rotina ergmm() não foram suficentes para convergência
+      control = control.ergmm(
+        sample.size = 8000,
+        burnin = 20000,
+        interval = 10,
+        threads = 4
+      )
+    )
+    
+    # Obtenção do grafo como uma derivação da sócio-matriz
+    # . Redução do número de arestas plotadas para melhor legibilidade do grafo
+    # . Cada aresta plotada representa 10 relacionamentos entre os vértices i e j
+    g = graph.adjacency(
+        adjmatrix = as.matrix(round(socio_mat/10),0),
+        mode = ifelse(isTRUE(Is.direct),"directed","undirected"),
+        diag = Has.Loops
+    )
+    
+    # Grafo resultante
+    plot.igraph(
+      g, main="Latent Distances Model - Procurstean MAP Estimation", vertex.size=20,
+      vertex.color="light blue", vertex.shape="circle", vertex.label=colnames(socio_mat),
+      vertex.label.font=2, vertex.label.cex=0.7, vertex.label.dist=0,
+      vertex.label.color="black", edge.color="grey", layout=map_fit$mcmc.pmode$Z
+    )
+
+    # Retorna as informações
+    return(list("output"=map_fit, "par"=map_fit$mcmc.pmode$Z))
+
+  }
+  
+  # Corpo principal
+  if(to.fit == "mle") {
+    out = ldm_procrustean_mle_fit(socio_mat, Is.direct, Is.Weighted, Has.Loops)
+  } else {
+    out = ldm_procrustean_map_fit(socio_mat, Is.direct, Is.Weighted, Has.Loops)
+  }
+  
+}
+ldm_fit = compiler::cmpfun(ldm_fit)
+
+# Resultados
+ldm_mle_fit = ldm_fit(social_matrix,F,T,F,"mle")
+ldm_map_fit = ldm_fit(social_matrix,F,T,F,"pmode")
+```
+
+- **Disposição idêntica da rede para os dois métodos de estimação**. Ambos os métodos de Máxima Verossimilhança
+e Máxima Densidade A Posteriori obtiveram as mesmas estimativas para as posições dos artistas, reforçando assim
+a hipótese de que configuração da rede obtida é de fato aquela do Modelo de Distâncias Latentes sobre a rede.
+
+- **Similaridade com o Escalonamento Multidimensional e Análise de Agrupamentos**. Observa-se aqui, mais uma vez,
+dois fortes clusters compostos pelos países latino-americanos e países europeus/asiáticos/norte-americanos. É como
+se o mundo inteiro tivesse razoável afinidade musical entre si, exceto pelos países de língua espanhola, pois
+estes possuem um gosto musical muito "próprio". Não obstante, de forma períferica, existem aqueles países que
+estão no "meio termo" por possuírem gosto musical mais eclético, composto de músicas únicas e também de músicas
+comuns aos demais dois grupos.
+
+## **6. Referências**
+- Borg I., Groenen, P. J. (2005). *Modern Mutidimensional Scaling: Theory and Applications*. Springer, New York, 261.
+
+- Cardoso-Junior M.M., Scarpel R.A. (2013). Métodos de construção e interpretação do mapa perceptual para estudos de percepção de riscos. *Revista Eletrônica Pesquisa Operacional para o Desenvolvimento*, 5(3):451-452.
+
+- Cox T. F., Cox M. A. A. (2001). *Multidimensional Scaling*. 2nd ed. London, Chapman and Hall, 31.
+
+- Csardi G, Nepusz T: *The igraph software package for complex network research, InterJournal, Complex Systems* 1695. 2006. Disponível em: <http://igraph.org>.
+
+- Gamerman D., Lopes H. F. (2006). *Markov Chain Monte Carlo - Stochastic Simulation for Bayesian Inference*. Chapman and Hall.
+
+- Geman S., Geman D. (1984). *Stochastic Relaxation, Gibbs Distribution and the Bayesian Restoration of Images*. *IEEE* *Transactions on Pattern Analysis and Machine Intelligence*, 6, 721-741.
+
+- Giannini, R. et al. *Web scraping for collecting price data: Are we doing it right? New Techniques and Technologies for* *Statistics* (NTTS), 2017.
+
+- Handcock M. S., Raftery A. E., Tantrum J. M. (2007). *Model-Based Clustering for Social Networks*. *Journal of the Royal* *Statistical Society, Series A*, 170(2), 301-354.
+
+- Hastings W. K. (1970). *Monte Carlo Sampling Methods Using Markov Chains and Their Applications*. *Biometrika*, 57, 97-109.
+
+- Hoff P. D., Raftery A. E., Handcock M. S. (2002). *Latent space approaches to social network analysis*. *Journal of the American Statistical Association*, 97(460):1090-1098.
+
+- Krivitsky P, Handcock M (2018). *latentnet: Latent Position and Cluster Models for Statistical Networks. The Statnet Project (http://www.statnet.org)*. R package version 2.9.0. Disponível em: <https://CRAN.R-project.org/package=latentnet>.
+
+- Metropolis N., Rosenbulth A. W., Rosenbulth M. N., Teller A. H., Teller E. (1953). Equation of State Calculations by Fast Computing Machine. *Journal of Chemical Physics*, 21, 1089-1091.
+
+- R Core Team (2019). R: *A language and environment for statistical computing. R Foundation for Statistical Computing*, Vienna, Austria. Disponível em: <https://www.R-project.org/>.
+
+- Torgerson W.S. (1952). *Multidimensional scaling: I. Theory and method*. *Psychometrika*, 17(4):401-419.
+
+- Quintanilha F.L (2010). Medidas de Centralidade em Grafos. *Instituto Alberto Luiz Coimbra de Pós-Graduação e Pesquisa*
+*de Engenharia (COPPE UFRJ)*.
+
+- Smith A.J. (2016). *Social Networks & Health Workshop. University Of Nebraska-Lincoln Departament of Sociology*. Disponível
+em: <https://www.slideshare.net/dnac2017/08-exponential-random-graph-models-2016>. Acesso em 10/02/2020.
+
+- Wikipedia, the free encyclopedia. *Maximum a posteriori estimation*. Disponível em: <https://en.wikipedia.org/wiki/Maximum_a_posteriori_estimation>. Acesso em: 10/02/2020.
+
+- Thiemichen S. et al. (2018). *Bayesian Exponential Random Graph Models with Nodal Random Effects*. 1, 1407-6895.
+
+- Krivitsky N.P et.al (2009). *Representing Degree Distributions, Clustering, and Homophily in Social Networks With Latent Cluster Random Effects Models*. *Soc Networks*. 31(3): 204–213.
+
