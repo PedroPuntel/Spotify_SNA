@@ -1,2 +1,2 @@
-# Python
-Topics that i've already scratched the surface with using the Python programming language. These are mostly scripts associated with courses, books and also other statistical concepts that i've come across as a undergraduate in statistics.
+# Social Network Analysis - Spotify
+Extension of my Social Network Analysis scholarship project for the Brazilian CNPq institution that took place in my 2nd year of college.
